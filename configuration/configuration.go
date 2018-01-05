@@ -1,16 +1,15 @@
 package configuration
 
 import (
-	"crypto/tls"
 	"fmt"
-	"io/ioutil"
-	"os"
 	"strings"
 	"time"
 
 	"github.com/containous/flaeg"
 	"github.com/containous/traefik/acme"
+	"github.com/containous/traefik/api"
 	"github.com/containous/traefik/log"
+	"github.com/containous/traefik/ping"
 	"github.com/containous/traefik/provider/boltdb"
 	"github.com/containous/traefik/provider/consul"
 	"github.com/containous/traefik/provider/docker"
@@ -23,12 +22,17 @@ import (
 	"github.com/containous/traefik/provider/marathon"
 	"github.com/containous/traefik/provider/mesos"
 	"github.com/containous/traefik/provider/rancher"
-	"github.com/containous/traefik/provider/web"
+	"github.com/containous/traefik/provider/rest"
+	"github.com/containous/traefik/provider/webapi"
 	"github.com/containous/traefik/provider/zk"
+	"github.com/containous/traefik/tls"
 	"github.com/containous/traefik/types"
 )
 
 const (
+	// DefaultInternalEntryPointName the name of the default internal entry point
+	DefaultInternalEntryPointName = "traefik"
+
 	// DefaultHealthCheckInterval is the default health check interval.
 	DefaultHealthCheckInterval = 30 * time.Second
 
@@ -37,17 +41,23 @@ const (
 
 	// DefaultIdleTimeout before closing an idle connection.
 	DefaultIdleTimeout = 180 * time.Second
+
+	// DefaultGraceTimeout controls how long Traefik serves pending requests
+	// prior to shutting down.
+	DefaultGraceTimeout = 10 * time.Second
 )
 
 // GlobalConfiguration holds global configuration (with providers, etc.).
 // It's populated from the traefik configuration file passed as an argument to the binary.
 type GlobalConfiguration struct {
-	GraceTimeOut              flaeg.Duration          `short:"g" description:"Duration to give active requests a chance to finish before Traefik stops" export:"true"`
+	LifeCycle                 *LifeCycle              `description:"Timeouts influencing the server life cycle" export:"true"`
+	GraceTimeOut              flaeg.Duration          `short:"g" description:"(Deprecated) Duration to give active requests a chance to finish before Traefik stops" export:"true"` // Deprecated
 	Debug                     bool                    `short:"d" description:"Enable debug mode" export:"true"`
 	CheckNewVersion           bool                    `description:"Periodically check if a new version has been released" export:"true"`
 	AccessLogsFile            string                  `description:"(Deprecated) Access logs file" export:"true"` // Deprecated
 	AccessLog                 *types.AccessLog        `description:"Access log settings" export:"true"`
-	TraefikLogsFile           string                  `description:"Traefik logs file. Stdout is used when omitted or empty" export:"true"`
+	TraefikLogsFile           string                  `description:"(Deprecated) Traefik logs file. Stdout is used when omitted or empty" export:"true"` // Deprecated
+	TraefikLog                *types.TraefikLog       `description:"Traefik log settings" export:"true"`
 	LogLevel                  string                  `short:"l" description:"Log level" export:"true"`
 	EntryPoints               EntryPoints             `description:"Entrypoints definition using format: --entryPoints='Name:http Address::8000 Redirect.EntryPoint:https' --entryPoints='Name:https Address::4442 TLS:tests/traefik.crt,tests/traefik.key;prod/traefik.crt,prod/traefik.key'" export:"true"`
 	Cluster                   *types.Cluster          `description:"Enable clustering" export:"true"`
@@ -58,14 +68,14 @@ type GlobalConfiguration struct {
 	MaxIdleConnsPerHost       int                     `description:"If non-zero, controls the maximum idle (keep-alive) to keep per-host.  If zero, DefaultMaxIdleConnsPerHost is used" export:"true"`
 	IdleTimeout               flaeg.Duration          `description:"(Deprecated) maximum amount of time an idle (keep-alive) connection will remain idle before closing itself." export:"true"` // Deprecated
 	InsecureSkipVerify        bool                    `description:"Disable SSL certificate verification" export:"true"`
-	RootCAs                   RootCAs                 `description:"Add cert file for self-signed certificate"`
+	RootCAs                   tls.RootCAs             `description:"Add cert file for self-signed certificate"`
 	Retry                     *Retry                  `description:"Enable retry sending request if network error" export:"true"`
 	HealthCheck               *HealthCheckConfig      `description:"Health check parameters" export:"true"`
 	RespondingTimeouts        *RespondingTimeouts     `description:"Timeouts for incoming requests to the Traefik instance" export:"true"`
 	ForwardingTimeouts        *ForwardingTimeouts     `description:"Timeouts for requests forwarded to the backend servers" export:"true"`
+	Web                       *WebCompatibility       `description:"(Deprecated) Enable Web backend with default settings" export:"true"` // Deprecated
 	Docker                    *docker.Provider        `description:"Enable Docker backend with default settings" export:"true"`
 	File                      *file.Provider          `description:"Enable File backend with default settings" export:"true"`
-	Web                       *web.Provider           `description:"Enable Web backend with default settings" export:"true"`
 	Marathon                  *marathon.Provider      `description:"Enable Marathon backend with default settings" export:"true"`
 	Consul                    *consul.Provider        `description:"Enable Consul backend with default settings" export:"true"`
 	ConsulCatalog             *consul.CatalogProvider `description:"Enable Consul catalog backend with default settings" export:"true"`
@@ -78,11 +88,76 @@ type GlobalConfiguration struct {
 	ECS                       *ecs.Provider           `description:"Enable ECS backend with default settings" export:"true"`
 	Rancher                   *rancher.Provider       `description:"Enable Rancher backend with default settings" export:"true"`
 	DynamoDB                  *dynamodb.Provider      `description:"Enable DynamoDB backend with default settings" export:"true"`
+	Rest                      *rest.Provider          `description:"Enable Rest backend with default settings" export:"true"`
+	WebAPI                    *webapi.Provider        `description:"Enable WebAPI backend"`
+	API                       *api.Handler            `description:"Enable api/dashboard" export:"true"`
+	Metrics                   *types.Metrics          `description:"Enable a metrics exporter" export:"true"`
+	Ping                      *ping.Handler           `description:"Enable ping" export:"true"`
+}
+
+// WebCompatibility is a configuration to handle compatibility with deprecated web provider options
+type WebCompatibility struct {
+	Address    string            `description:"Web administration port" export:"true"`
+	CertFile   string            `description:"SSL certificate" export:"true"`
+	KeyFile    string            `description:"SSL certificate" export:"true"`
+	ReadOnly   bool              `description:"Enable read only API" export:"true"`
+	Statistics *types.Statistics `description:"Enable more detailed statistics" export:"true"`
+	Metrics    *types.Metrics    `description:"Enable a metrics exporter" export:"true"`
+	Path       string            `description:"Root path for dashboard and API" export:"true"`
+	Auth       *types.Auth       `export:"true"`
+	Debug      bool              `export:"true"`
+}
+
+func (gc *GlobalConfiguration) handleWebDeprecation() {
+	if gc.Web != nil {
+		log.Warn("web provider configuration is deprecated, you should use these options : api, rest provider, ping and metrics")
+
+		if gc.API != nil || gc.Metrics != nil || gc.Ping != nil || gc.Rest != nil {
+			log.Warn("web option is ignored if you use it with one of these options : api, rest provider, ping or metrics")
+			return
+		}
+		gc.EntryPoints[DefaultInternalEntryPointName] = &EntryPoint{
+			Address: gc.Web.Address,
+			Auth:    gc.Web.Auth,
+		}
+		if gc.Web.CertFile != "" {
+			gc.EntryPoints[DefaultInternalEntryPointName].TLS = &tls.TLS{
+				Certificates: []tls.Certificate{
+					{
+						CertFile: tls.FileOrContent(gc.Web.CertFile),
+						KeyFile:  tls.FileOrContent(gc.Web.KeyFile),
+					},
+				},
+			}
+		}
+
+		if gc.API == nil {
+			gc.API = &api.Handler{
+				EntryPoint: DefaultInternalEntryPointName,
+				Statistics: gc.Web.Statistics,
+				Dashboard:  true,
+			}
+		}
+
+		if gc.Ping == nil {
+			gc.Ping = &ping.Handler{
+				EntryPoint: DefaultInternalEntryPointName,
+			}
+		}
+
+		if gc.Metrics == nil {
+			gc.Metrics = gc.Web.Metrics
+		}
+
+		if !gc.Debug {
+			gc.Debug = gc.Web.Debug
+		}
+	}
 }
 
 // SetEffectiveConfiguration adds missing configuration parameters derived from existing ones.
 // It also takes care of maintaining backwards compatibility.
-func (gc *GlobalConfiguration) SetEffectiveConfiguration() {
+func (gc *GlobalConfiguration) SetEffectiveConfiguration(configFile string) {
 	if len(gc.EntryPoints) == 0 {
 		gc.EntryPoints = map[string]*EntryPoint{"http": {
 			Address:          ":80",
@@ -91,12 +166,34 @@ func (gc *GlobalConfiguration) SetEffectiveConfiguration() {
 		gc.DefaultEntryPoints = []string{"http"}
 	}
 
+	gc.handleWebDeprecation()
+
+	if (gc.API != nil && gc.API.EntryPoint == DefaultInternalEntryPointName) ||
+		(gc.Ping != nil && gc.Ping.EntryPoint == DefaultInternalEntryPointName) ||
+		(gc.Metrics != nil && gc.Metrics.Prometheus != nil && gc.Metrics.Prometheus.EntryPoint == DefaultInternalEntryPointName) ||
+		(gc.Rest != nil && gc.Rest.EntryPoint == DefaultInternalEntryPointName) {
+		if _, ok := gc.EntryPoints[DefaultInternalEntryPointName]; !ok {
+			gc.EntryPoints[DefaultInternalEntryPointName] = &EntryPoint{Address: ":8080"}
+		}
+	}
+
 	// ForwardedHeaders must be remove in the next breaking version
 	for entryPointName := range gc.EntryPoints {
 		entryPoint := gc.EntryPoints[entryPointName]
 		if entryPoint.ForwardedHeaders == nil {
 			entryPoint.ForwardedHeaders = &ForwardedHeaders{Insecure: true}
 		}
+	}
+
+	// Make sure LifeCycle isn't nil to spare nil checks elsewhere.
+	if gc.LifeCycle == nil {
+		gc.LifeCycle = &LifeCycle{}
+	}
+
+	// Prefer legacy grace timeout parameter for backwards compatibility reasons.
+	if gc.GraceTimeOut > 0 {
+		log.Warn("top-level grace period configuration has been deprecated -- please use lifecycle grace period")
+		gc.LifeCycle.GraceTimeOut = gc.GraceTimeOut
 	}
 
 	if gc.Rancher != nil {
@@ -121,12 +218,26 @@ func (gc *GlobalConfiguration) SetEffectiveConfiguration() {
 		}
 	}
 
-	if gc.Debug {
-		gc.LogLevel = "DEBUG"
+	if gc.API != nil {
+		gc.API.Debug = gc.Debug
 	}
 
+	if gc.Debug {
+		gc.LogLevel = "DEBUG"
 	if gc.Web != nil && (gc.Web.Path == "" || !strings.HasSuffix(gc.Web.Path, "/")) {
+	}
+
 		gc.Web.Path += "/"
+	}
+
+	// Try to fallback to traefik config file in case the file provider is enabled
+	// but has no file name configured.
+	if gc.File != nil && len(gc.File.Filename) == 0 {
+		if len(configFile) > 0 {
+			gc.File.Filename = configFile
+		} else {
+			log.Errorln("Error using file configuration backend, no filename defined")
+		}
 	}
 }
 
@@ -168,68 +279,6 @@ func (dep *DefaultEntryPoints) Type() string {
 	return "defaultentrypoints"
 }
 
-// RootCAs hold the CA we want to have in root
-type RootCAs []FileOrContent
-
-// FileOrContent hold a file path or content
-type FileOrContent string
-
-func (f FileOrContent) String() string {
-	return string(f)
-}
-
-func (f FileOrContent) Read() ([]byte, error) {
-	var content []byte
-	if _, err := os.Stat(f.String()); err == nil {
-		content, err = ioutil.ReadFile(f.String())
-		if err != nil {
-			return nil, err
-		}
-	} else {
-		content = []byte(f)
-	}
-	return content, nil
-}
-
-// String is the method to format the flag's value, part of the flag.Value interface.
-// The String method's output will be used in diagnostics.
-func (r *RootCAs) String() string {
-	sliceOfString := make([]string, len([]FileOrContent(*r)))
-	for key, value := range *r {
-		sliceOfString[key] = value.String()
-	}
-	return strings.Join(sliceOfString, ",")
-}
-
-// Set is the method to set the flag value, part of the flag.Value interface.
-// Set's argument is a string to be parsed to set the flag.
-// It's a comma-separated list, so we split it.
-func (r *RootCAs) Set(value string) error {
-	rootCAs := strings.Split(value, ",")
-	if len(rootCAs) == 0 {
-		return fmt.Errorf("bad RootCAs format: %s", value)
-	}
-	for _, rootCA := range rootCAs {
-		*r = append(*r, FileOrContent(rootCA))
-	}
-	return nil
-}
-
-// Get return the EntryPoints map
-func (r *RootCAs) Get() interface{} {
-	return RootCAs(*r)
-}
-
-// SetValue sets the EntryPoints map with val
-func (r *RootCAs) SetValue(val interface{}) {
-	*r = RootCAs(val.(RootCAs))
-}
-
-// Type is type of the struct
-func (r *RootCAs) Type() string {
-	return "rootcas"
-}
-
 // EntryPoints holds entry points configuration of the reverse proxy (ip, port, TLS...)
 type EntryPoints map[string]*EntryPoint
 
@@ -245,23 +294,27 @@ func (ep *EntryPoints) String() string {
 func (ep *EntryPoints) Set(value string) error {
 	result := parseEntryPointsConfiguration(value)
 
-	var configTLS *TLS
+	var configTLS *tls.TLS
 	if len(result["tls"]) > 0 {
-		certs := Certificates{}
+		certs := tls.Certificates{}
 		if err := certs.Set(result["tls"]); err != nil {
 			return err
 		}
-		configTLS = &TLS{
+		configTLS = &tls.TLS{
 			Certificates: certs,
 		}
 	} else if len(result["tls_acme"]) > 0 {
-		configTLS = &TLS{
-			Certificates: Certificates{},
+		configTLS = &tls.TLS{
+			Certificates: tls.Certificates{},
 		}
 	}
 	if len(result["ca"]) > 0 {
 		files := strings.Split(result["ca"], ",")
-		configTLS.ClientCAFiles = files
+		optional := toBool(result, "ca_optional")
+		configTLS.ClientCA = tls.ClientCA{
+			Files:    files,
+			Optional: optional,
+		}
 	}
 	var redirect *Redirect
 	if len(result["redirect_entrypoint"]) > 0 || len(result["redirect_regex"]) > 0 || len(result["redirect_replacement"]) > 0 {
@@ -368,7 +421,7 @@ func (ep *EntryPoints) Type() string {
 type EntryPoint struct {
 	Network              string
 	Address              string
-	TLS                  *TLS        `export:"true"`
+	TLS                  *tls.TLS    `export:"true"`
 	Redirect             *Redirect   `export:"true"`
 	Auth                 *types.Auth `export:"true"`
 	WhitelistSourceRange []string
@@ -382,123 +435,6 @@ type Redirect struct {
 	EntryPoint  string
 	Regex       string
 	Replacement string
-}
-
-// TLS configures TLS for an entry point
-type TLS struct {
-	MinVersion    string `export:"true"`
-	CipherSuites  []string
-	Certificates  Certificates
-	ClientCAFiles []string
-}
-
-// MinVersion Map of allowed TLS minimum versions
-var MinVersion = map[string]uint16{
-	`VersionTLS10`: tls.VersionTLS10,
-	`VersionTLS11`: tls.VersionTLS11,
-	`VersionTLS12`: tls.VersionTLS12,
-}
-
-// CipherSuites Map of TLS CipherSuites from crypto/tls
-// Available CipherSuites defined at https://golang.org/pkg/crypto/tls/#pkg-constants
-var CipherSuites = map[string]uint16{
-	`TLS_RSA_WITH_RC4_128_SHA`:                tls.TLS_RSA_WITH_RC4_128_SHA,
-	`TLS_RSA_WITH_3DES_EDE_CBC_SHA`:           tls.TLS_RSA_WITH_3DES_EDE_CBC_SHA,
-	`TLS_RSA_WITH_AES_128_CBC_SHA`:            tls.TLS_RSA_WITH_AES_128_CBC_SHA,
-	`TLS_RSA_WITH_AES_256_CBC_SHA`:            tls.TLS_RSA_WITH_AES_256_CBC_SHA,
-	`TLS_RSA_WITH_AES_128_CBC_SHA256`:         tls.TLS_RSA_WITH_AES_128_CBC_SHA256,
-	`TLS_RSA_WITH_AES_128_GCM_SHA256`:         tls.TLS_RSA_WITH_AES_128_GCM_SHA256,
-	`TLS_RSA_WITH_AES_256_GCM_SHA384`:         tls.TLS_RSA_WITH_AES_256_GCM_SHA384,
-	`TLS_ECDHE_ECDSA_WITH_RC4_128_SHA`:        tls.TLS_ECDHE_ECDSA_WITH_RC4_128_SHA,
-	`TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA`:    tls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA,
-	`TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA`:    tls.TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA,
-	`TLS_ECDHE_RSA_WITH_RC4_128_SHA`:          tls.TLS_ECDHE_RSA_WITH_RC4_128_SHA,
-	`TLS_ECDHE_RSA_WITH_3DES_EDE_CBC_SHA`:     tls.TLS_ECDHE_RSA_WITH_3DES_EDE_CBC_SHA,
-	`TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA`:      tls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,
-	`TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA`:      tls.TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,
-	`TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256`: tls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256,
-	`TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256`:   tls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256,
-	`TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256`:   tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
-	`TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256`: tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
-	`TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384`:   tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
-	`TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384`: tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
-	`TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305`:    tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,
-	`TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305`:  tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,
-}
-
-// Certificates defines traefik certificates type
-// Certs and Keys could be either a file path, or the file content itself
-type Certificates []Certificate
-
-//CreateTLSConfig creates a TLS config from Certificate structures
-func (certs *Certificates) CreateTLSConfig() (*tls.Config, error) {
-	config := &tls.Config{}
-	config.Certificates = []tls.Certificate{}
-	certsSlice := []Certificate(*certs)
-	for _, v := range certsSlice {
-		var err error
-
-		certContent, err := v.CertFile.Read()
-		if err != nil {
-			return nil, err
-		}
-
-		keyContent, err := v.KeyFile.Read()
-		if err != nil {
-			return nil, err
-		}
-
-		cert, err := tls.X509KeyPair(certContent, keyContent)
-		if err != nil {
-			return nil, err
-		}
-
-		config.Certificates = append(config.Certificates, cert)
-	}
-	return config, nil
-}
-
-// String is the method to format the flag's value, part of the flag.Value interface.
-// The String method's output will be used in diagnostics.
-func (certs *Certificates) String() string {
-	if len(*certs) == 0 {
-		return ""
-	}
-	var result []string
-	for _, certificate := range *certs {
-		result = append(result, certificate.CertFile.String()+","+certificate.KeyFile.String())
-	}
-	return strings.Join(result, ";")
-}
-
-// Set is the method to set the flag value, part of the flag.Value interface.
-// Set's argument is a string to be parsed to set the flag.
-// It's a comma-separated list, so we split it.
-func (certs *Certificates) Set(value string) error {
-	certificates := strings.Split(value, ";")
-	for _, certificate := range certificates {
-		files := strings.Split(certificate, ",")
-		if len(files) != 2 {
-			return fmt.Errorf("bad certificates format: %s", value)
-		}
-		*certs = append(*certs, Certificate{
-			CertFile: FileOrContent(files[0]),
-			KeyFile:  FileOrContent(files[1]),
-		})
-	}
-	return nil
-}
-
-// Type is type of the struct
-func (certs *Certificates) Type() string {
-	return "certificates"
-}
-
-// Certificate holds a SSL cert/key pair
-// Certs and Key could be either a file path, or the file content itself
-type Certificate struct {
-	CertFile FileOrContent
-	KeyFile  FileOrContent
 }
 
 // Retry contains request retry config
@@ -534,4 +470,11 @@ type ProxyProtocol struct {
 type ForwardedHeaders struct {
 	Insecure   bool
 	TrustedIPs []string
+}
+
+// LifeCycle contains configurations relevant to the lifecycle (such as the
+// shutdown phase) of Traefik.
+type LifeCycle struct {
+	RequestAcceptGraceTimeout flaeg.Duration `description:"Duration to keep accepting requests before Traefik initiates the graceful shutdown procedure"`
+	GraceTimeOut              flaeg.Duration `description:"Duration to give active requests a chance to finish before Traefik stops"`
 }

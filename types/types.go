@@ -11,7 +11,9 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/containous/flaeg"
 	"github.com/containous/traefik/log"
+	traefikTls "github.com/containous/traefik/tls"
 	"github.com/docker/libkv/store"
 	"github.com/ryanuber/go-glob"
 )
@@ -71,6 +73,19 @@ type ErrorPage struct {
 	Status  []string `json:"status,omitempty"`
 	Backend string   `json:"backend,omitempty"`
 	Query   string   `json:"query,omitempty"`
+}
+
+// Rate holds a rate limiting configuration for a specific time period
+type Rate struct {
+	Period  flaeg.Duration `json:"period,omitempty"`
+	Average int64          `json:"average,omitempty"`
+	Burst   int64          `json:"burst,omitempty"`
+}
+
+// RateLimit holds a rate limiting configuration for a given frontend
+type RateLimit struct {
+	RateSet       map[string]*Rate `json:"rateset,omitempty"`
+	ExtractorFunc string           `json:"extractorFunc,omitempty"`
 }
 
 // Headers holds the custom header configuration
@@ -137,6 +152,7 @@ type Frontend struct {
 	WhitelistSourceRange []string             `json:"whitelistSourceRange,omitempty"`
 	Headers              Headers              `json:"headers,omitempty"`
 	Errors               map[string]ErrorPage `json:"errors,omitempty"`
+	RateLimit            *RateLimit           `json:"ratelimit,omitempty"`
 }
 
 // LoadBalancerMethod holds the method of load balancing to use.
@@ -173,8 +189,9 @@ type Configurations map[string]*Configuration
 
 // Configuration of a provider.
 type Configuration struct {
-	Backends  map[string]*Backend  `json:"backends,omitempty"`
-	Frontends map[string]*Frontend `json:"frontends,omitempty"`
+	Backends         map[string]*Backend         `json:"backends,omitempty"`
+	Frontends        map[string]*Frontend        `json:"frontends,omitempty"`
+	TLSConfiguration []*traefikTls.Configuration `json:"tlsConfiguration,omitempty"`
 }
 
 // ConfigMessage hold configuration information exchanged between parts of traefik.
@@ -353,11 +370,13 @@ type Metrics struct {
 	Prometheus *Prometheus `description:"Prometheus metrics exporter type" export:"true"`
 	Datadog    *Datadog    `description:"DataDog metrics exporter type" export:"true"`
 	StatsD     *Statsd     `description:"StatsD metrics exporter type" export:"true"`
+	InfluxDB   *InfluxDB   `description:"InfluxDB metrics exporter type"`
 }
 
 // Prometheus can contain specific configuration used by the Prometheus Metrics exporter
 type Prometheus struct {
-	Buckets Buckets `description:"Buckets for latency metrics" export:"true"`
+	Buckets    Buckets `description:"Buckets for latency metrics" export:"true"`
+	EntryPoint string  `description:"EntryPoint" export:"true"`
 }
 
 // Datadog contains address and metrics pushing interval configuration
@@ -369,7 +388,13 @@ type Datadog struct {
 // Statsd contains address and metrics pushing interval configuration
 type Statsd struct {
 	Address      string `description:"StatsD address"`
-	PushInterval string `description:"DataDog push interval" export:"true"`
+	PushInterval string `description:"StatsD push interval" export:"true"`
+}
+
+// InfluxDB contains address and metrics pushing interval configuration
+type InfluxDB struct {
+	Address      string `description:"InfluxDB address"`
+	PushInterval string `description:"InfluxDB push interval"`
 }
 
 // Buckets holds Prometheus Buckets
@@ -404,6 +429,12 @@ func (b *Buckets) SetValue(val interface{}) {
 	*b = Buckets(val.(Buckets))
 }
 
+// TraefikLog holds the configuration settings for the traefik logger.
+type TraefikLog struct {
+	FilePath string `json:"file,omitempty" description:"Traefik log file path. Stdout is used when omitted or empty"`
+	Format   string `json:"format,omitempty" description:"Traefik log format: json | common"`
+}
+
 // AccessLog holds the configuration settings for the access logger (middlewares/accesslog).
 type AccessLog struct {
 	FilePath string `json:"file,omitempty" description:"Access log file path. Stdout is used when omitted or empty" export:"true"`
@@ -414,6 +445,7 @@ type AccessLog struct {
 // CA, Cert and Key can be either path or file contents
 type ClientTLS struct {
 	CA                 string `description:"TLS CA"`
+	CAOptional         bool   `description:"TLS CA.Optional"`
 	Cert               string `description:"TLS cert"`
 	Key                string `description:"TLS key"`
 	InsecureSkipVerify bool   `description:"TLS insecure skip verify"`
@@ -427,6 +459,7 @@ func (clientTLS *ClientTLS) CreateTLSConfig() (*tls.Config, error) {
 		return nil, nil
 	}
 	caPool := x509.NewCertPool()
+	clientAuth := tls.NoClientCert
 	if clientTLS.CA != "" {
 		var ca []byte
 		if _, errCA := os.Stat(clientTLS.CA); errCA == nil {
@@ -438,6 +471,11 @@ func (clientTLS *ClientTLS) CreateTLSConfig() (*tls.Config, error) {
 			ca = []byte(clientTLS.CA)
 		}
 		caPool.AppendCertsFromPEM(ca)
+		if clientTLS.CAOptional {
+			clientAuth = tls.VerifyClientCertIfGiven
+		} else {
+			clientAuth = tls.RequireAndVerifyClientCert
+		}
 	}
 
 	cert := tls.Certificate{}
@@ -474,6 +512,7 @@ func (clientTLS *ClientTLS) CreateTLSConfig() (*tls.Config, error) {
 		Certificates:       []tls.Certificate{cert},
 		RootCAs:            caPool,
 		InsecureSkipVerify: clientTLS.InsecureSkipVerify,
+		ClientAuth:         clientAuth,
 	}
 	return TLSConfig, nil
 }

@@ -62,10 +62,13 @@ And here is another example with client certificate authentication:
   [entryPoints.https]
   address = ":443"
   [entryPoints.https.tls]
-  clientCAFiles = ["tests/clientca1.crt", "tests/clientca2.crt"]
-    [[entryPoints.https.tls.certificates]]
-    certFile = "tests/traefik.crt"
-    keyFile = "tests/traefik.key"
+    [entryPoints.https.tls]
+      [entryPoints.https.tls.ClientCA]
+      files = ["tests/clientca1.crt", "tests/clientca2.crt"]
+      optional = false
+      [[entryPoints.https.tls.certificates]]
+      certFile = "tests/traefik.crt"
+      keyFile = "tests/traefik.key"
 ```
 
 - We enable SSL on `https` by giving a certificate and a key.
@@ -86,6 +89,7 @@ Following is the list of existing modifier rules:
 
 - `AddPrefix: /products`: Add path prefix to the existing request path prior to forwarding the request to the backend.
 - `ReplacePath: /serverless-path`: Replaces the path and adds the old path to the `X-Replaced-Path` header. Useful for mapping to AWS Lambda or Google Cloud Functions.
+- `ReplacePathRegex: ^/api/v2/(.*) /api/$1`: Replaces the path with a regular expression and adds the old path to the `X-Replaced-Path` header. Separate the regular expression and the replacement by a space.
 
 #### Matchers
 
@@ -298,6 +302,35 @@ In this example, traffic routed through the first frontend will have the `X-Fram
 
 !!! note
     The detailed documentation for those security headers can be found in [unrolled/secure](https://github.com/unrolled/secure#available-options).
+
+#### Rate limiting
+
+Rate limiting can be configured per frontend.  
+Multiple sets of rates can be added to each frontend, but the time periods must be unique.
+
+```toml
+[frontends]
+    [frontends.frontend1]
+    passHostHeader = true
+    entrypoints = ["http"]
+    backend = "backend1"
+        [frontends.frontend1.routes.test_1]
+        rule = "Path:/"
+    [frontends.frontend1.ratelimit]
+    extractorfunc = "client.ip"
+        [frontends.frontend1.ratelimit.rateset.rateset1]
+        period = "10s"
+        average = 100
+        burst = 200
+        [frontends.frontend1.ratelimit.rateset.rateset2]
+        period = "3s"
+        average = 5
+        burst = 10
+```
+
+In the above example, frontend1 is configured to limit requests by the client's ip address.  
+An average of 5 requests every 3 seconds is allowed and an average of 100 requests every 10 seconds.  
+These can "burst" up to 10 and 200 in each period respectively.
 
 ### Backends
 

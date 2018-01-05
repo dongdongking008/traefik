@@ -16,7 +16,7 @@ Step 0 : FROM golang:1.9-alpine
  ---> 8c6473912976
 Step 1 : RUN go get github.com/Masterminds/glide
 [...]
-docker run --rm  -v "/var/run/docker.sock:/var/run/docker.sock" -it -e OS_ARCH_ARG -e OS_PLATFORM_ARG -e TESTFLAGS -v "/home/emile/dev/go/src/github.com/containous/traefik/"dist":/go/src/github.com/containous/traefik/"dist"" "traefik-dev:no-more-godep-ever" ./script/make.sh generate binary
+docker run --rm  -v "/var/run/docker.sock:/var/run/docker.sock" -it -e OS_ARCH_ARG -e OS_PLATFORM_ARG -e TESTFLAGS -v "/home/user/go/src/github.com/containous/traefik/"dist":/go/src/github.com/containous/traefik/"dist"" "traefik-dev:no-more-godep-ever" ./script/make.sh generate binary
 ---> Making bundle: generate (in .)
 removed 'gen.go'
 
@@ -108,7 +108,7 @@ integration test using the `test-integration` target.
 $ make test-unit
 docker build -t "traefik-dev:your-feature-branch" -f build.Dockerfile .
 # […]
-docker run --rm -it -e OS_ARCH_ARG -e OS_PLATFORM_ARG -e TESTFLAGS -v "/home/vincent/src/github/vdemeester/traefik/dist:/go/src/github.com/containous/traefik/dist" "traefik-dev:your-feature-branch" ./script/make.sh generate test-unit
+docker run --rm -it -e OS_ARCH_ARG -e OS_PLATFORM_ARG -e TESTFLAGS -v "/home/user/go/src/github/containous/traefik/dist:/go/src/github.com/containous/traefik/dist" "traefik-dev:your-feature-branch" ./script/make.sh generate test-unit
 ---> Making bundle: generate (in .)
 removed 'gen.go'
 
@@ -138,14 +138,35 @@ More: https://labix.org/gocheck
 
 #### Method 2: `go`
 
-- Tests can be run from the cloned directory, by `$ go test ./...` which should return `ok` similar to:
+Unit tests can be run from the cloned directory by `$ go test ./...` which should return `ok` similar to:
 ```
-ok      _/home/vincent/src/github/vdemeester/traefik    0.004s
+ok      _/home/user/go/src/github/containous/traefik    0.004s
 ```
+
+Integration tests must be run from the `integration/` directory and require the `-integration` switch to be passed like this: `$ cd integration && go test -integration ./...`.
 
 ## Documentation
 
 The [documentation site](http://docs.traefik.io/) is built with [mkdocs](http://mkdocs.org/)
+
+### Method 1: `Docker` and `make`
+
+You can test documentation using the `docs` target.
+
+```bash
+$ make docs
+docker build -t traefik-docs -f docs.Dockerfile .
+# […]
+docker run  --rm -v /home/user/go/github/containous/traefik:/mkdocs -p 8000:8000 traefik-docs mkdocs serve
+# […]
+[I 170828 20:47:48 server:283] Serving on http://0.0.0.0:8000
+[I 170828 20:47:48 handlers:60] Start watching changes
+[I 170828 20:47:48 handlers:62] Start detecting changes
+```
+
+And go to [http://127.0.0.1:8000](http://127.0.0.1:8000).
+
+### Method 2: `mkdocs`
 
 First make sure you have python and pip installed
 
@@ -159,7 +180,7 @@ pip 1.5.2
 Then install mkdocs with pip
 
 ```shell
-$ pip install mkdocs
+pip install --user -r requirements.txt
 ```
 
 To test documentation locally run `mkdocs serve` in the root directory, this should start a server locally to preview your changes.

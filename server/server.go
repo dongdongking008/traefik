@@ -17,6 +17,7 @@ import (
 	"reflect"
 	"regexp"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -34,6 +35,7 @@ import (
 	"github.com/containous/traefik/provider"
 	"github.com/containous/traefik/safe"
 	"github.com/containous/traefik/server/cookie"
+	traefikTls "github.com/containous/traefik/tls"
 	"github.com/containous/traefik/types"
 	"github.com/containous/traefik/whitelist"
 	"github.com/streamrail/concurrent-map"
@@ -42,6 +44,7 @@ import (
 	"github.com/vulcand/oxy/cbreaker"
 	"github.com/vulcand/oxy/connlimit"
 	"github.com/vulcand/oxy/forward"
+	"github.com/vulcand/oxy/ratelimit"
 	"github.com/vulcand/oxy/roundrobin"
 	"github.com/vulcand/oxy/utils"
 	"golang.org/x/net/http2"
@@ -67,6 +70,8 @@ type Server struct {
 	leadership                    *cluster.Leadership
 	defaultForwardingRoundTripper http.RoundTripper
 	metricsRegistry               metrics.Registry
+	lastReceivedConfiguration     *safe.Safe
+	lastConfigs                   cmap.ConcurrentMap
 }
 
 type serverEntryPoints map[string]*serverEntryPoint
@@ -75,6 +80,7 @@ type serverEntryPoint struct {
 	httpServer *http.Server
 	listener   net.Listener
 	httpRouter *middlewares.HandlerSwitcher
+	certs      safe.Safe
 }
 
 type serverRoute struct {
@@ -83,6 +89,7 @@ type serverRoute struct {
 	stripPrefixesRegex []string
 	addPrefix          string
 	replacePath        string
+	replacePathRegex   string
 }
 
 // NewServer returns an initialized Server.
@@ -99,12 +106,18 @@ func NewServer(globalConfiguration configuration.GlobalConfiguration) *Server {
 	currentConfigurations := make(types.Configurations)
 	server.currentConfigurations.Set(currentConfigurations)
 	server.globalConfiguration = globalConfiguration
+	if server.globalConfiguration.API != nil {
+		server.globalConfiguration.API.CurrentConfigurations = &server.currentConfigurations
+	}
+
 	server.routinesPool = safe.NewPool(context.Background())
 	server.defaultForwardingRoundTripper = createHTTPTransport(globalConfiguration)
+	server.lastReceivedConfiguration = safe.New(time.Unix(0, 0))
+	server.lastConfigs = cmap.New()
 
 	server.metricsRegistry = metrics.NewVoidRegistry()
-	if globalConfiguration.Web != nil && globalConfiguration.Web.Metrics != nil {
-		server.registerMetricClients(globalConfiguration.Web.Metrics)
+	if globalConfiguration.Metrics != nil {
+		server.registerMetricClients(globalConfiguration.Metrics)
 	}
 
 	if globalConfiguration.Cluster != nil {
@@ -165,7 +178,7 @@ func createHTTPTransport(globalConfiguration configuration.GlobalConfiguration) 
 	return transport
 }
 
-func createRootCACertPool(rootCAs configuration.RootCAs) *x509.CertPool {
+func createRootCACertPool(rootCAs traefikTls.RootCAs) *x509.CertPool {
 	roots := x509.NewCertPool()
 
 	for _, cert := range rootCAs {
@@ -208,7 +221,7 @@ func (server *Server) Stop() {
 		wg.Add(1)
 		go func(serverEntryPointName string, serverEntryPoint *serverEntryPoint) {
 			defer wg.Done()
-			graceTimeOut := time.Duration(server.globalConfiguration.GraceTimeOut)
+			graceTimeOut := time.Duration(server.globalConfiguration.LifeCycle.GraceTimeOut)
 			ctx, cancel := context.WithTimeout(context.Background(), graceTimeOut)
 			log.Debugf("Waiting %s seconds before killing connections on entrypoint %s...", graceTimeOut, serverEntryPointName)
 			if err := serverEntryPoint.httpServer.Shutdown(ctx); err != nil {
@@ -225,7 +238,7 @@ func (server *Server) Stop() {
 
 // Close destroys the server
 func (server *Server) Close() {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(server.globalConfiguration.GraceTimeOut))
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(server.globalConfiguration.LifeCycle.GraceTimeOut))
 	go func(ctx context.Context) {
 		<-ctx.Done()
 		if ctx.Err() == context.Canceled {
@@ -274,19 +287,21 @@ func (server *Server) startHTTPServers() {
 
 func (server *Server) setupServerEntryPoint(newServerEntryPointName string, newServerEntryPoint *serverEntryPoint) *serverEntryPoint {
 	serverMiddlewares := []negroni.Handler{middlewares.NegroniRecoverHandler()}
+	serverInternalMiddlewares := []negroni.Handler{middlewares.NegroniRecoverHandler()}
 	if server.accessLoggerMiddleware != nil {
 		serverMiddlewares = append(serverMiddlewares, server.accessLoggerMiddleware)
 	}
 	if server.metricsRegistry.IsEnabled() {
 		serverMiddlewares = append(serverMiddlewares, middlewares.NewMetricsWrapper(server.metricsRegistry, newServerEntryPointName))
 	}
-	if server.globalConfiguration.Web != nil {
-		server.globalConfiguration.Web.Stats = thoas_stats.New()
-		serverMiddlewares = append(serverMiddlewares, server.globalConfiguration.Web.Stats)
-		if server.globalConfiguration.Web.Statistics != nil {
-			server.globalConfiguration.Web.StatsRecorder = middlewares.NewStatsRecorder(server.globalConfiguration.Web.Statistics.RecentErrors)
-			serverMiddlewares = append(serverMiddlewares, server.globalConfiguration.Web.StatsRecorder)
+	if server.globalConfiguration.API != nil {
+		server.globalConfiguration.API.Stats = thoas_stats.New()
+		serverMiddlewares = append(serverMiddlewares, server.globalConfiguration.API.Stats)
+		if server.globalConfiguration.API.Statistics != nil {
+			server.globalConfiguration.API.StatsRecorder = middlewares.NewStatsRecorder(server.globalConfiguration.API.Statistics.RecentErrors)
+			serverMiddlewares = append(serverMiddlewares, server.globalConfiguration.API.StatsRecorder)
 		}
+
 	}
 	if server.globalConfiguration.EntryPoints[newServerEntryPointName].Auth != nil {
 		authMiddleware, err := mauth.NewAuthenticator(server.globalConfiguration.EntryPoints[newServerEntryPointName].Auth)
@@ -294,6 +309,7 @@ func (server *Server) setupServerEntryPoint(newServerEntryPointName string, newS
 			log.Fatal("Error starting server: ", err)
 		}
 		serverMiddlewares = append(serverMiddlewares, authMiddleware)
+		serverInternalMiddlewares = append(serverInternalMiddlewares, authMiddleware)
 	}
 	if server.globalConfiguration.EntryPoints[newServerEntryPointName].Compress {
 		serverMiddlewares = append(serverMiddlewares, &middlewares.Compress{})
@@ -304,8 +320,9 @@ func (server *Server) setupServerEntryPoint(newServerEntryPointName string, newS
 			log.Fatal("Error starting server: ", err)
 		}
 		serverMiddlewares = append(serverMiddlewares, ipWhitelistMiddleware)
+		serverInternalMiddlewares = append(serverInternalMiddlewares, ipWhitelistMiddleware)
 	}
-	newSrv, listener, err := server.prepareServer(newServerEntryPointName, server.globalConfiguration.EntryPoints[newServerEntryPointName], newServerEntryPoint.httpRouter, serverMiddlewares...)
+	newSrv, listener, err := server.prepareServer(newServerEntryPointName, server.globalConfiguration.EntryPoints[newServerEntryPointName], newServerEntryPoint.httpRouter, serverMiddlewares, serverInternalMiddlewares)
 	if err != nil {
 		log.Fatal("Error preparing server: ", err)
 	}
@@ -317,48 +334,51 @@ func (server *Server) setupServerEntryPoint(newServerEntryPointName string, newS
 }
 
 func (server *Server) listenProviders(stop chan bool) {
-	lastReceivedConfiguration := safe.New(time.Unix(0, 0))
-	lastConfigs := cmap.New()
 	for {
 		select {
 		case <-stop:
 			return
 		case configMsg, ok := <-server.configurationChan:
-			if !ok {
+			if !ok || configMsg.Configuration == nil {
 				return
 			}
-			server.defaultConfigurationValues(configMsg.Configuration)
-			currentConfigurations := server.currentConfigurations.Get().(types.Configurations)
-			jsonConf, _ := json.Marshal(configMsg.Configuration)
-			log.Debugf("Configuration received from provider %s: %s", configMsg.ProviderName, string(jsonConf))
-			if configMsg.Configuration == nil || configMsg.Configuration.Backends == nil && configMsg.Configuration.Frontends == nil {
-				log.Infof("Skipping empty Configuration for provider %s", configMsg.ProviderName)
-			} else if reflect.DeepEqual(currentConfigurations[configMsg.ProviderName], configMsg.Configuration) {
-				log.Infof("Skipping same configuration for provider %s", configMsg.ProviderName)
-			} else {
-				lastConfigs.Set(configMsg.ProviderName, &configMsg)
-				lastReceivedConfigurationValue := lastReceivedConfiguration.Get().(time.Time)
-				providersThrottleDuration := time.Duration(server.globalConfiguration.ProvidersThrottleDuration)
-				if time.Now().After(lastReceivedConfigurationValue.Add(providersThrottleDuration)) {
-					log.Debugf("Last %s config received more than %s, OK", configMsg.ProviderName, server.globalConfiguration.ProvidersThrottleDuration.String())
-					// last config received more than n s ago
-					server.configurationValidatedChan <- configMsg
-				} else {
-					log.Debugf("Last %s config received less than %s, waiting...", configMsg.ProviderName, server.globalConfiguration.ProvidersThrottleDuration)
-					safe.Go(func() {
-						<-time.After(providersThrottleDuration)
-						lastReceivedConfigurationValue := lastReceivedConfiguration.Get().(time.Time)
-						if time.Now().After(lastReceivedConfigurationValue.Add(time.Duration(providersThrottleDuration))) {
-							log.Debugf("Waited for %s config, OK", configMsg.ProviderName)
-							if lastConfig, ok := lastConfigs.Get(configMsg.ProviderName); ok {
-								server.configurationValidatedChan <- *lastConfig.(*types.ConfigMessage)
-							}
-						}
-					})
-				}
-				lastReceivedConfiguration.Set(time.Now())
-			}
+			server.preLoadConfiguration(configMsg)
 		}
+	}
+}
+
+func (server *Server) preLoadConfiguration(configMsg types.ConfigMessage) {
+	server.defaultConfigurationValues(configMsg.Configuration)
+	currentConfigurations := server.currentConfigurations.Get().(types.Configurations)
+	jsonConf, _ := json.Marshal(configMsg.Configuration)
+	log.Debugf("Configuration received from provider %s: %s", configMsg.ProviderName, string(jsonConf))
+	if configMsg.Configuration == nil || configMsg.Configuration.Backends == nil && configMsg.Configuration.Frontends == nil && configMsg.Configuration.TLSConfiguration == nil {
+		log.Infof("Skipping empty Configuration for provider %s", configMsg.ProviderName)
+	} else if reflect.DeepEqual(currentConfigurations[configMsg.ProviderName], configMsg.Configuration) {
+		log.Infof("Skipping same configuration for provider %s", configMsg.ProviderName)
+	} else {
+		server.lastConfigs.Set(configMsg.ProviderName, &configMsg)
+		lastReceivedConfigurationValue := server.lastReceivedConfiguration.Get().(time.Time)
+		providersThrottleDuration := time.Duration(server.globalConfiguration.ProvidersThrottleDuration)
+		if time.Now().After(lastReceivedConfigurationValue.Add(providersThrottleDuration)) {
+			log.Debugf("Last %s configuration received more than %s, OK", configMsg.ProviderName, server.globalConfiguration.ProvidersThrottleDuration.String())
+			// last config received more than n server ago
+			server.configurationValidatedChan <- configMsg
+		} else {
+			log.Debugf("Last %s configuration received less than %s, waiting...", configMsg.ProviderName, server.globalConfiguration.ProvidersThrottleDuration.String())
+			safe.Go(func() {
+				<-time.After(providersThrottleDuration)
+				lastReceivedConfigurationValue := server.lastReceivedConfiguration.Get().(time.Time)
+				if time.Now().After(lastReceivedConfigurationValue.Add(time.Duration(providersThrottleDuration))) {
+					log.Debugf("Waited for %s configuration, OK", configMsg.ProviderName)
+					if lastConfig, ok := server.lastConfigs.Get(configMsg.ProviderName); ok {
+						server.configurationValidatedChan <- *lastConfig.(*types.ConfigMessage)
+					}
+				}
+			})
+		}
+		// Update the last configuration loading time
+		server.lastReceivedConfiguration.Set(time.Now())
 	}
 }
 
@@ -376,34 +396,73 @@ func (server *Server) listenConfigurations(stop chan bool) {
 		case <-stop:
 			return
 		case configMsg, ok := <-server.configurationValidatedChan:
-			if !ok {
+			if !ok || configMsg.Configuration == nil {
 				return
 			}
-			currentConfigurations := server.currentConfigurations.Get().(types.Configurations)
-
-			// Copy configurations to new map so we don't change current if LoadConfig fails
-			newConfigurations := make(types.Configurations)
-			for k, v := range currentConfigurations {
-				newConfigurations[k] = v
-			}
-			newConfigurations[configMsg.ProviderName] = configMsg.Configuration
-
-			newServerEntryPoints, err := server.loadConfig(newConfigurations, server.globalConfiguration)
-			if err == nil {
-				for newServerEntryPointName, newServerEntryPoint := range newServerEntryPoints {
-					server.serverEntryPoints[newServerEntryPointName].httpRouter.UpdateHandler(newServerEntryPoint.httpRouter.GetHandler())
-					log.Infof("Server configuration reloaded on %s", server.serverEntryPoints[newServerEntryPointName].httpServer.Addr)
-				}
-				server.currentConfigurations.Set(newConfigurations)
-				server.postLoadConfig()
-			} else {
-				log.Error("Error loading new configuration, aborted ", err)
-			}
+			server.loadConfiguration(configMsg)
 		}
 	}
 }
 
-func (server *Server) postLoadConfig() {
+// loadConfiguration manages dynamically frontends, backends and TLS configurations
+func (server *Server) loadConfiguration(configMsg types.ConfigMessage) {
+	currentConfigurations := server.currentConfigurations.Get().(types.Configurations)
+
+	// Copy configurations to new map so we don't change current if LoadConfig fails
+	newConfigurations := make(types.Configurations)
+	for k, v := range currentConfigurations {
+		newConfigurations[k] = v
+	}
+	newConfigurations[configMsg.ProviderName] = configMsg.Configuration
+
+	newServerEntryPoints, err := server.loadConfig(newConfigurations, server.globalConfiguration)
+	if err == nil {
+		for newServerEntryPointName, newServerEntryPoint := range newServerEntryPoints {
+			server.serverEntryPoints[newServerEntryPointName].httpRouter.UpdateHandler(newServerEntryPoint.httpRouter.GetHandler())
+			if &newServerEntryPoint.certs != nil {
+				server.serverEntryPoints[newServerEntryPointName].certs.Set(newServerEntryPoint.certs.Get())
+			}
+			log.Infof("Server configuration reloaded on %s", server.serverEntryPoints[newServerEntryPointName].httpServer.Addr)
+		}
+		server.currentConfigurations.Set(newConfigurations)
+		server.postLoadConfiguration()
+	} else {
+		log.Error("Error loading new configuration, aborted ", err)
+	}
+}
+
+// loadHTTPSConfiguration add/delete HTTPS certificate managed dynamically
+func (server *Server) loadHTTPSConfiguration(configurations types.Configurations) (map[string]*traefikTls.DomainsCertificates, error) {
+	newEPCertificates := make(map[string]*traefikTls.DomainsCertificates)
+	// Get all certificates
+	for _, configuration := range configurations {
+		if configuration.TLSConfiguration != nil && len(configuration.TLSConfiguration) > 0 {
+			if err := traefikTls.SortTLSConfigurationPerEntryPoints(configuration.TLSConfiguration, newEPCertificates); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return newEPCertificates, nil
+}
+
+// getCertificate allows to customize tlsConfig.Getcertificate behaviour to get the certificates inserted dynamically
+func (s *serverEntryPoint) getCertificate(clientHello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+	if s.certs.Get() != nil {
+		domainToCheck := types.CanonicalDomain(clientHello.ServerName)
+		for domains, cert := range *s.certs.Get().(*traefikTls.DomainsCertificates) {
+			for _, domain := range strings.Split(domains, ",") {
+				selector := "^" + strings.Replace(domain, "*.", "[^\\.]*\\.?", -1) + "$"
+				domainCheck, _ := regexp.MatchString(selector, domainToCheck)
+				if domainCheck {
+					return cert, nil
+				}
+			}
+		}
+	}
+	return nil, nil
+}
+
+func (server *Server) postLoadConfiguration() {
 	if server.globalConfiguration.ACME == nil {
 		return
 	}
@@ -418,8 +477,8 @@ func (server *Server) postLoadConfig() {
 				// check if one of the frontend entrypoints is configured with TLS
 				// and is configured with ACME
 				ACMEEnabled := false
-				for _, entrypoint := range frontend.EntryPoints {
-					if server.globalConfiguration.ACME.EntryPoint == entrypoint && server.globalConfiguration.EntryPoints[entrypoint].TLS != nil {
+				for _, entryPoint := range frontend.EntryPoints {
+					if server.globalConfiguration.ACME.EntryPoint == entryPoint && server.globalConfiguration.EntryPoints[entryPoint].TLS != nil {
 						ACMEEnabled = true
 						break
 					}
@@ -452,10 +511,9 @@ func (server *Server) configureProviders() {
 	if server.globalConfiguration.File != nil {
 		server.providers = append(server.providers, server.globalConfiguration.File)
 	}
-	if server.globalConfiguration.Web != nil {
-		server.globalConfiguration.Web.CurrentConfigurations = &server.currentConfigurations
-		server.globalConfiguration.Web.Debug = server.globalConfiguration.Debug
-		server.providers = append(server.providers, server.globalConfiguration.Web)
+	if server.globalConfiguration.Rest != nil {
+		server.providers = append(server.providers, server.globalConfiguration.Rest)
+		server.globalConfiguration.Rest.CurrentConfigurations = &server.currentConfigurations
 	}
 	if server.globalConfiguration.Consul != nil {
 		server.providers = append(server.providers, server.globalConfiguration.Consul)
@@ -490,6 +548,9 @@ func (server *Server) configureProviders() {
 	if server.globalConfiguration.DynamoDB != nil {
 		server.providers = append(server.providers, server.globalConfiguration.DynamoDB)
 	}
+	if server.globalConfiguration.WebAPI != nil {
+		server.providers = append(server.providers, server.globalConfiguration.WebAPI)
+	}
 }
 
 func (server *Server) startProviders() {
@@ -508,19 +569,24 @@ func (server *Server) startProviders() {
 	}
 }
 
-func createClientTLSConfig(tlsOption *configuration.TLS) (*tls.Config, error) {
+func createClientTLSConfig(entryPointName string, tlsOption *traefikTls.TLS) (*tls.Config, error) {
 	if tlsOption == nil {
 		return nil, errors.New("no TLS provided")
 	}
 
-	config, err := tlsOption.Certificates.CreateTLSConfig()
+	config, _, err := tlsOption.Certificates.CreateTLSConfig(entryPointName)
 	if err != nil {
 		return nil, err
 	}
 
 	if len(tlsOption.ClientCAFiles) > 0 {
+		log.Warnf("Deprecated configuration found during client TLS configuration creation: %s. Please use %s (which allows to make the CA Files optional).", "tls.ClientCAFiles", "tls.ClientCA.files")
+		tlsOption.ClientCA.Files = tlsOption.ClientCAFiles
+		tlsOption.ClientCA.Optional = false
+	}
+	if len(tlsOption.ClientCA.Files) > 0 {
 		pool := x509.NewCertPool()
-		for _, caFile := range tlsOption.ClientCAFiles {
+		for _, caFile := range tlsOption.ClientCA.Files {
 			data, err := ioutil.ReadFile(caFile)
 			if err != nil {
 				return nil, err
@@ -536,22 +602,33 @@ func createClientTLSConfig(tlsOption *configuration.TLS) (*tls.Config, error) {
 }
 
 // creates a TLS config that allows terminating HTTPS for multiple domains using SNI
-func (server *Server) createTLSConfig(entryPointName string, tlsOption *configuration.TLS, router *middlewares.HandlerSwitcher) (*tls.Config, error) {
+func (server *Server) createTLSConfig(entryPointName string, tlsOption *traefikTls.TLS, router *middlewares.HandlerSwitcher) (*tls.Config, error) {
 	if tlsOption == nil {
 		return nil, nil
 	}
 
-	config, err := tlsOption.Certificates.CreateTLSConfig()
+	config, epDomainsCertificates, err := tlsOption.Certificates.CreateTLSConfig(entryPointName)
 	if err != nil {
 		return nil, err
 	}
-
+	epDomainsCertificatesTmp := new(traefikTls.DomainsCertificates)
+	if epDomainsCertificates[entryPointName] != nil {
+		epDomainsCertificatesTmp = epDomainsCertificates[entryPointName]
+	} else {
+		*epDomainsCertificatesTmp = make(map[string]*tls.Certificate)
+	}
+	server.serverEntryPoints[entryPointName].certs.Set(epDomainsCertificatesTmp)
 	// ensure http2 enabled
 	config.NextProtos = []string{"h2", "http/1.1"}
 
 	if len(tlsOption.ClientCAFiles) > 0 {
+		log.Warnf("Deprecated configuration found during TLS configuration creation: %s. Please use %s (which allows to make the CA Files optional).", "tls.ClientCAFiles", "tls.ClientCA.files")
+		tlsOption.ClientCA.Files = tlsOption.ClientCAFiles
+		tlsOption.ClientCA.Optional = false
+	}
+	if len(tlsOption.ClientCA.Files) > 0 {
 		pool := x509.NewCertPool()
-		for _, caFile := range tlsOption.ClientCAFiles {
+		for _, caFile := range tlsOption.ClientCA.Files {
 			data, err := ioutil.ReadFile(caFile)
 			if err != nil {
 				return nil, err
@@ -562,7 +639,11 @@ func (server *Server) createTLSConfig(entryPointName string, tlsOption *configur
 			}
 		}
 		config.ClientCAs = pool
-		config.ClientAuth = tls.RequireAndVerifyClientCert
+		if tlsOption.ClientCA.Optional {
+			config.ClientAuth = tls.VerifyClientCertIfGiven
+		} else {
+			config.ClientAuth = tls.RequireAndVerifyClientCert
+		}
 	}
 
 	if server.globalConfiguration.ACME != nil {
@@ -578,12 +659,12 @@ func (server *Server) createTLSConfig(entryPointName string, tlsOption *configur
 					return false
 				}
 				if server.leadership == nil {
-					err := server.globalConfiguration.ACME.CreateLocalConfig(config, checkOnDemandDomain)
+					err := server.globalConfiguration.ACME.CreateLocalConfig(config, &server.serverEntryPoints[entryPointName].certs, checkOnDemandDomain)
 					if err != nil {
 						return nil, err
 					}
 				} else {
-					err := server.globalConfiguration.ACME.CreateClusterConfig(server.leadership, config, checkOnDemandDomain)
+					err := server.globalConfiguration.ACME.CreateClusterConfig(server.leadership, config, &server.serverEntryPoints[entryPointName].certs, checkOnDemandDomain)
 					if err != nil {
 						return nil, err
 					}
@@ -592,6 +673,8 @@ func (server *Server) createTLSConfig(entryPointName string, tlsOption *configur
 		} else {
 			return nil, errors.New("Unknown entrypoint " + server.globalConfiguration.ACME.EntryPoint + " for ACME configuration")
 		}
+	} else {
+		config.GetCertificate = server.serverEntryPoints[entryPointName].getCertificate
 	}
 	if len(config.Certificates) == 0 {
 		return nil, errors.New("No certificates found for TLS entrypoint " + entryPointName)
@@ -600,7 +683,7 @@ func (server *Server) createTLSConfig(entryPointName string, tlsOption *configur
 	// in each certificate and populates the config.NameToCertificate map.
 	config.BuildNameToCertificate()
 	//Set the minimum TLS version if set in the config TOML
-	if minConst, exists := configuration.MinVersion[server.globalConfiguration.EntryPoints[entryPointName].TLS.MinVersion]; exists {
+	if minConst, exists := traefikTls.MinVersion[server.globalConfiguration.EntryPoints[entryPointName].TLS.MinVersion]; exists {
 		config.PreferServerCipherSuites = true
 		config.MinVersion = minConst
 	}
@@ -609,7 +692,7 @@ func (server *Server) createTLSConfig(entryPointName string, tlsOption *configur
 		//if our list of CipherSuites is defined in the entrypoint config, we can re-initilize the suites list as empty
 		config.CipherSuites = make([]uint16, 0)
 		for _, cipher := range server.globalConfiguration.EntryPoints[entryPointName].TLS.CipherSuites {
-			if cipherConst, exists := configuration.CipherSuites[cipher]; exists {
+			if cipherConst, exists := traefikTls.CipherSuites[cipher]; exists {
 				config.CipherSuites = append(config.CipherSuites, cipherConst)
 			} else {
 				//CipherSuite listed in the toml does not exist in our listed
@@ -617,7 +700,6 @@ func (server *Server) createTLSConfig(entryPointName string, tlsOption *configur
 			}
 		}
 	}
-
 	return config, nil
 }
 
@@ -629,12 +711,32 @@ func (server *Server) startServer(serverEntryPoint *serverEntryPoint, globalConf
 	} else {
 		err = serverEntryPoint.httpServer.Serve(serverEntryPoint.listener)
 	}
-	if err != nil {
+	if err != http.ErrServerClosed {
 		log.Error("Error creating server: ", err)
 	}
 }
 
-func (server *Server) prepareServer(entryPointName string, entryPoint *configuration.EntryPoint, router *middlewares.HandlerSwitcher, middlewares ...negroni.Handler) (*http.Server, net.Listener, error) {
+func (server *Server) addInternalRoutes(entryPointName string, router *mux.Router) {
+	if server.globalConfiguration.Metrics != nil && server.globalConfiguration.Metrics.Prometheus != nil && server.globalConfiguration.Metrics.Prometheus.EntryPoint == entryPointName {
+		metrics.PrometheusHandler{}.AddRoutes(router)
+	}
+
+	if server.globalConfiguration.Rest != nil && server.globalConfiguration.Rest.EntryPoint == entryPointName {
+		server.globalConfiguration.Rest.AddRoutes(router)
+	}
+
+	if server.globalConfiguration.API != nil && server.globalConfiguration.API.EntryPoint == entryPointName {
+		server.globalConfiguration.API.AddRoutes(router)
+	}
+}
+
+func (server *Server) addInternalPublicRoutes(entryPointName string, router *mux.Router) {
+	if server.globalConfiguration.Ping != nil && server.globalConfiguration.Ping.EntryPoint != "" && server.globalConfiguration.Ping.EntryPoint == entryPointName {
+		server.globalConfiguration.Ping.AddRoutes(router)
+	}
+}
+
+func (server *Server) prepareServer(entryPointName string, entryPoint *configuration.EntryPoint, router *middlewares.HandlerSwitcher, middlewares []negroni.Handler, internalMiddlewares []negroni.Handler) (*http.Server, net.Listener, error) {
 	readTimeout, writeTimeout, idleTimeout := buildServerTimeouts(server.globalConfiguration)
 	log.Infof("Preparing server %s %+v with readTimeout=%s writeTimeout=%s idleTimeout=%s", entryPointName, entryPoint, readTimeout, writeTimeout, idleTimeout)
 
@@ -644,6 +746,14 @@ func (server *Server) prepareServer(entryPointName string, entryPoint *configura
 		n.Use(middleware)
 	}
 	n.UseHandler(router)
+
+	path := "/"
+	if server.globalConfiguration.Web != nil && server.globalConfiguration.Web.Path != "" {
+		path = server.globalConfiguration.Web.Path
+	}
+
+	internalMuxRouter := server.buildInternalRouter(entryPointName, path, internalMiddlewares)
+	internalMuxRouter.NotFoundHandler = n
 
 	tlsConfig, err := server.createTLSConfig(entryPointName, entryPoint.TLS, router)
 	if err != nil {
@@ -660,7 +770,7 @@ func (server *Server) prepareServer(entryPointName string, entryPoint *configura
 	if entryPoint.ProxyProtocol != nil {
 		IPs, err := whitelist.NewIP(entryPoint.ProxyProtocol.TrustedIPs, entryPoint.ProxyProtocol.Insecure)
 		if err != nil {
-			return nil, nil, fmt.Errorf("Error creating whitelist: %s", err)
+			return nil, nil, fmt.Errorf("error creating whitelist: %s", err)
 		}
 		log.Infof("Enabling ProxyProtocol for trusted IPs %v", entryPoint.ProxyProtocol.TrustedIPs)
 		listener = &proxyproto.Listener{
@@ -677,7 +787,7 @@ func (server *Server) prepareServer(entryPointName string, entryPoint *configura
 
 	return &http.Server{
 			Addr:         entryPoint.Address,
-			Handler:      n,
+			Handler:      internalMuxRouter,
 			TLSConfig:    tlsConfig,
 			ReadTimeout:  readTimeout,
 			WriteTimeout: writeTimeout,
@@ -686,6 +796,31 @@ func (server *Server) prepareServer(entryPointName string, entryPoint *configura
 		},
 		listener,
 		nil
+}
+
+func (server *Server) buildInternalRouter(entryPointName, path string, internalMiddlewares []negroni.Handler) *mux.Router {
+	internalMuxRouter := mux.NewRouter()
+	internalMuxRouter.StrictSlash(true)
+	internalMuxRouter.SkipClean(true)
+
+	internalMuxSubrouter := internalMuxRouter.PathPrefix(path).Subrouter()
+	internalMuxSubrouter.StrictSlash(true)
+	internalMuxSubrouter.SkipClean(true)
+
+	server.addInternalRoutes(entryPointName, internalMuxSubrouter)
+	internalMuxRouter.Walk(wrapRoute(internalMiddlewares))
+
+	server.addInternalPublicRoutes(entryPointName, internalMuxSubrouter)
+	return internalMuxRouter
+}
+
+// wrapRoute with middlewares
+func wrapRoute(middlewares []negroni.Handler) func(*mux.Route, *mux.Router, []*mux.Route) error {
+	return func(route *mux.Route, router *mux.Router, ancestors []*mux.Route) error {
+		middles := append(middlewares, negroni.Wrap(route.GetHandler()))
+		route.Handler(negroni.New(middles...))
+		return nil
+	}
 }
 
 func buildServerTimeouts(globalConfig configuration.GlobalConfiguration) (readTimeout, writeTimeout, idleTimeout time.Duration) {
@@ -722,9 +857,9 @@ func (server *Server) buildEntryPoints(globalConfiguration configuration.GlobalC
 
 // getRoundTripper will either use server.defaultForwardingRoundTripper or create a new one
 // given a custom TLS configuration is passed and the passTLSCert option is set to true.
-func (server *Server) getRoundTripper(globalConfiguration configuration.GlobalConfiguration, passTLSCert bool, tls *configuration.TLS) (http.RoundTripper, error) {
+func (server *Server) getRoundTripper(entryPointName string, globalConfiguration configuration.GlobalConfiguration, passTLSCert bool, tls *traefikTls.TLS) (http.RoundTripper, error) {
 	if passTLSCert {
-		tlsConfig, err := createClientTLSConfig(tls)
+		tlsConfig, err := createClientTLSConfig(entryPointName, tls)
 		if err != nil {
 			log.Errorf("Failed to create TLSClientConfig: %s", err)
 			return nil, err
@@ -803,7 +938,7 @@ func (server *Server) loadConfig(configurations types.Configurations, globalConf
 				if backends[entryPointName+frontend.Backend] == nil {
 					log.Debugf("Creating backend %s", frontend.Backend)
 
-					roundTripper, err := server.getRoundTripper(globalConfiguration, frontend.PassTLSCert, entryPoint.TLS)
+					roundTripper, err := server.getRoundTripper(entryPointName, globalConfiguration, frontend.PassTLSCert, entryPoint.TLS)
 					if err != nil {
 						log.Errorf("Failed to create RoundTripper for frontend %s: %v", frontendName, err)
 						log.Errorf("Skipping frontend %s...", frontendName)
@@ -919,6 +1054,15 @@ func (server *Server) loadConfig(configurations types.Configurations, globalConf
 						}
 					}
 
+					if frontend.RateLimit != nil && len(frontend.RateLimit.RateSet) > 0 {
+						lb, err = server.buildRateLimiter(lb, frontend.RateLimit)
+						if err != nil {
+							log.Errorf("Error creating rate limiter: %v", err)
+							log.Errorf("Skipping frontend %s...", frontendName)
+							continue frontend
+						}
+					}
+
 					maxConns := config.Backends[frontend.Backend].MaxConn
 					if maxConns != nil && maxConns.Amount != 0 {
 						extractFunc, err := utils.NewExtractor(maxConns.ExtractorFunc)
@@ -1011,11 +1155,19 @@ func (server *Server) loadConfig(configurations types.Configurations, globalConf
 		}
 	}
 	healthcheck.GetHealthCheck().SetBackendsConfiguration(server.routinesPool.Ctx(), backendsHealthCheck)
-	//sort routes
-	for _, serverEntryPoint := range serverEntryPoints {
+	// Get new certificates list sorted per entrypoints
+	// Update certificates
+	entryPointsCertificates, err := server.loadHTTPSConfiguration(configurations)
+	//sort routes and update certificates
+	for serverEntryPointName, serverEntryPoint := range serverEntryPoints {
 		serverEntryPoint.httpRouter.GetHandler().SortRoutes()
+		_, exists := entryPointsCertificates[serverEntryPointName]
+		if exists {
+			serverEntryPoint.certs.Set(entryPointsCertificates[serverEntryPointName])
+		}
 	}
-	return serverEntryPoints, nil
+
+	return serverEntryPoints, err
 }
 
 func configureLBServers(lb healthcheck.LoadBalancer, config *types.Configuration, frontend *types.Frontend) error {
@@ -1056,6 +1208,15 @@ func (server *Server) wireFrontendBackend(serverRoute *serverRoute, handler http
 		handler = &middlewares.ReplacePath{
 			Path:    serverRoute.replacePath,
 			Handler: handler,
+		}
+	}
+
+	if len(serverRoute.replacePathRegex) > 0 {
+		sp := strings.Split(serverRoute.replacePathRegex, " ")
+		if len(sp) == 2 {
+			handler = middlewares.NewReplacePathRegexHandler(sp[0], sp[1], handler)
+		} else {
+			log.Warnf("Invalid syntax for ReplacePathRegex: %s. Separate the regular expression and the replacement by a space.", serverRoute.replacePathRegex)
 		}
 	}
 
@@ -1226,6 +1387,10 @@ func (server *Server) registerMetricClients(metricsConfig *types.Metrics) {
 	if metricsConfig.StatsD != nil {
 		registries = append(registries, metrics.RegisterStatsd(metricsConfig.StatsD))
 		log.Debugf("Configured StatsD metrics pushing to %s once every %s", metricsConfig.StatsD.Address, metricsConfig.StatsD.PushInterval)
+	if metricsConfig.InfluxDB != nil {
+	}
+		registries = append(registries, metrics.RegisterInfluxDB(metricsConfig.InfluxDB))
+		log.Debugf("Configured InfluxDB metrics pushing to %s once every %s", metricsConfig.InfluxDB.Address, metricsConfig.InfluxDB.PushInterval)
 	}
 
 	if len(registries) > 0 {
@@ -1236,6 +1401,22 @@ func (server *Server) registerMetricClients(metricsConfig *types.Metrics) {
 func stopMetricsClients() {
 	metrics.StopDatadog()
 	metrics.StopStatsd()
+	metrics.StopInfluxDB()
+}
+
+func (server *Server) buildRateLimiter(handler http.Handler, rlConfig *types.RateLimit) (http.Handler, error) {
+	extractFunc, err := utils.NewExtractor(rlConfig.ExtractorFunc)
+	if err != nil {
+		return nil, err
+	}
+	log.Debugf("Creating load-balancer rate limiter")
+	rateSet := ratelimit.NewRateSet()
+	for _, rate := range rlConfig.RateSet {
+		if err := rateSet.Add(time.Duration(rate.Period), rate.Average, rate.Burst); err != nil {
+			return nil, err
+		}
+	}
+	return ratelimit.New(handler, extractFunc, rateSet, ratelimit.Logger(oxyLogger))
 }
 
 func (server *Server) buildRetryMiddleware(handler http.Handler, globalConfig configuration.GlobalConfiguration, countServers int, backendName string) http.Handler {

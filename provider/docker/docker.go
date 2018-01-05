@@ -14,7 +14,6 @@ import (
 
 	"github.com/BurntSushi/ty/fun"
 	"github.com/cenk/backoff"
-	"github.com/containous/traefik/job"
 	"github.com/containous/traefik/log"
 	"github.com/containous/traefik/provider"
 	"github.com/containous/traefik/safe"
@@ -34,7 +33,7 @@ import (
 
 const (
 	// SwarmAPIVersion is a constant holding the version of the Provider API traefik will use
-	SwarmAPIVersion string = "1.24"
+	SwarmAPIVersion = "1.24"
 	// SwarmDefaultWatchTime is the duration of the interval when polling docker
 	SwarmDefaultWatchTime = 15 * time.Second
 
@@ -48,13 +47,13 @@ var _ provider.Provider = (*Provider)(nil)
 
 // Provider holds configurations of the provider.
 type Provider struct {
-	provider.BaseProvider `mapstructure:",squash" export:"true"`
-	Endpoint              string           `description:"Docker server endpoint. Can be a tcp or a unix socket endpoint"`
-	Domain                string           `description:"Default domain used"`
-	TLS                   *types.ClientTLS `description:"Enable Docker TLS support" export:"true"`
-	ExposedByDefault      bool             `description:"Expose containers by default" export:"true"`
-	UseBindPortIP         bool             `description:"Use the ip address from the bound port, rather than from the inner network" export:"true"`
-	SwarmMode             bool             `description:"Use Docker on Swarm Mode" export:"true"`
+	provider.BaseProvider             `mapstructure:",squash" export:"true"`
+	Endpoint         string           `description:"Docker server endpoint. Can be a tcp or a unix socket endpoint"`
+	Domain           string           `description:"Default domain used"`
+	TLS              *types.ClientTLS `description:"Enable Docker TLS support" export:"true"`
+	ExposedByDefault bool             `description:"Expose containers by default" export:"true"`
+	UseBindPortIP    bool             `description:"Use the ip address from the bound port, rather than from the inner network" export:"true"`
+	SwarmMode        bool             `description:"Use Docker on Swarm Mode" export:"true"`
 }
 
 // dockerData holds the need data to the Provider p
@@ -64,6 +63,7 @@ type dockerData struct {
 	Labels          map[string]string // List of labels set to container or service
 	NetworkSettings networkSettings
 	Health          string
+	Node            *dockertypes.ContainerNode
 }
 
 // NetworkSettings holds the networks data to the Provider p
@@ -162,28 +162,25 @@ func (p *Provider) Provide(configurationChan chan<- types.ConfigMessage, pool *s
 			if p.Watch {
 				ctx, cancel := context.WithCancel(ctx)
 				if p.SwarmMode {
-					errChan := make(chan error)
+					stopChan := make(chan struct{})
 					// TODO: This need to be change. Linked to Swarm events docker/docker#23827
 					ticker := time.NewTicker(SwarmDefaultWatchTime)
 					pool.Go(func(stop chan bool) {
-						defer close(errChan)
+						defer close(stopChan)
 						for {
 							select {
 							case <-ticker.C:
 								services, err := p.listServices(ctx, dockerClient)
 								if err != nil {
 									log.Errorf("Failed to list services for docker, error %s", err)
-									errChan <- err
-									return
-								}
-								configuration := p.loadDockerConfig(services)
-								if configuration != nil {
-									configurationChan <- types.ConfigMessage{
-										ProviderName:  "docker",
-										Configuration: configuration,
+								} else {
+									if configuration := p.loadDockerConfig(services); configuration != nil {
+										configurationChan <- types.ConfigMessage{
+											ProviderName:  "docker",
+											Configuration: configuration,
+										}
 									}
 								}
-
 							case <-stop:
 								ticker.Stop()
 								cancel()
@@ -191,11 +188,9 @@ func (p *Provider) Provide(configurationChan chan<- types.ConfigMessage, pool *s
 							}
 						}
 					})
-					if err, ok := <-errChan; ok {
-						return err
-					}
 					// channel closed
-
+					<-stopChan
+					log.Info("Stop watching as expected")
 				} else {
 					pool.Go(func(stop chan bool) {
 						for {
@@ -248,7 +243,7 @@ func (p *Provider) Provide(configurationChan chan<- types.ConfigMessage, pool *s
 		notify := func(err error, time time.Duration) {
 			log.Errorf("Provider connection error %+v, retrying in %s", err, time)
 		}
-		err := backoff.RetryNotify(safe.OperationWithRecover(operation), job.NewBackOff(backoff.NewExponentialBackOff()), notify)
+		err := backoff.RetryNotify(safe.OperationWithRecover(operation), backoff.NewConstantBackOff(time.Second*3), notify)
 		if err != nil {
 			log.Errorf("Cannot connect to docker server %+v", err)
 		}
@@ -293,6 +288,10 @@ func (p *Provider) loadDockerConfig(containersInspected []dockerData) *types.Con
 		"getServicePriority":          p.getServicePriority,
 		"getServiceBackend":           p.getServiceBackend,
 		"getWhitelistSourceRange":     p.getWhitelistSourceRange,
+		"getRequestHeaders":           p.getRequestHeaders,
+		"getResponseHeaders":          p.getResponseHeaders,
+		"hasRequestHeaders":           p.hasRequestHeaders,
+		"hasResponseHeaders":          p.hasResponseHeaders,
 	}
 	// filter containers
 	filteredContainers := fun.Filter(func(container dockerData) bool {
@@ -524,6 +523,11 @@ func (p *Provider) getMaxConnExtractorFunc(container dockerData) string {
 }
 
 func (p *Provider) containerFilter(container dockerData) bool {
+	if !isContainerEnabled(container, p.ExposedByDefault) {
+		log.Debugf("Filtering disabled container %s", container.Name)
+		return false
+	}
+
 	var err error
 	portLabel := "traefik.port label"
 	if p.hasServices(container) {
@@ -534,11 +538,6 @@ func (p *Provider) containerFilter(container dockerData) bool {
 	}
 	if len(container.NetworkSettings.Ports) == 0 && err != nil {
 		log.Debugf("Filtering container without port and no %s %s : %s", portLabel, container.Name, err.Error())
-		return false
-	}
-
-	if !isContainerEnabled(container, p.ExposedByDefault) {
-		log.Debugf("Filtering disabled container %s", container.Name)
 		return false
 	}
 
@@ -601,6 +600,9 @@ func checkServiceLabelPort(container dockerData) error {
 }
 
 func (p *Provider) getFrontendName(container dockerData, idx int) string {
+	if label, err := getLabel(container, types.LabelFrontend); err == nil {
+		return label
+	}
 	// Replace '.' with '-' in quoted keys because of this issue https://github.com/BurntSushi/toml/issues/78
 	return provider.Normalize(p.getFrontendRule(container) + "-" + strconv.Itoa(idx))
 }
@@ -643,9 +645,13 @@ func (p *Provider) getIPAddress(container dockerData) string {
 		}
 	}
 
-	// If net==host, quick n' dirty, we return 127.0.0.1
-	// This will work locally, but will fail with swarm.
 	if container.NetworkSettings.NetworkMode.IsHost() {
+		if container.Node != nil {
+			if container.Node.IPAddress != "" {
+				return container.Node.IPAddress
+			}
+		}
+
 		return "127.0.0.1"
 	}
 
@@ -793,6 +799,41 @@ func (p *Provider) getBasicAuth(container dockerData) []string {
 	return []string{}
 }
 
+func (p *Provider) hasRequestHeaders(container dockerData) bool {
+	label, err := getLabel(container, types.LabelFrontendRequestHeader)
+	return err == nil && len(label) > 0
+}
+
+func (p *Provider) hasResponseHeaders(container dockerData) bool {
+	label, err := getLabel(container, types.LabelFrontendResponseHeader)
+	return err == nil && len(label) > 0
+}
+
+func (p *Provider) getRequestHeaders(container dockerData) map[string]string {
+	return parseCustomHeaders(container, types.LabelFrontendRequestHeader)
+}
+
+func (p *Provider) getResponseHeaders(container dockerData) map[string]string {
+	return parseCustomHeaders(container, types.LabelFrontendResponseHeader)
+}
+
+func parseCustomHeaders(container dockerData, containerType string) map[string]string {
+	customHeaders := make(map[string]string)
+	if label, err := getLabel(container, containerType); err == nil {
+		for _, headers := range strings.Split(label, ",") {
+			pair := strings.Split(headers, ":")
+			if len(pair) != 2 {
+				log.Warnf("Could not load header %v, skipping...", pair)
+			} else {
+				customHeaders[pair[0]] = pair[1]
+			}
+		}
+	}
+	if len(customHeaders) == 0 {
+		log.Errorf("Could not load any custom headers")
+	}
+	return customHeaders
+}
 func isContainerEnabled(container dockerData, exposedByDefault bool) bool {
 	return exposedByDefault && container.Labels[types.LabelEnable] != "false" || container.Labels[types.LabelEnable] == "true"
 }
@@ -854,6 +895,7 @@ func parseContainer(container dockertypes.ContainerJSON) dockerData {
 	if container.ContainerJSONBase != nil {
 		dockerData.Name = container.ContainerJSONBase.Name
 		dockerData.ServiceName = dockerData.Name //Default ServiceName to be the container's Name.
+		dockerData.Node = container.ContainerJSONBase.Node
 
 		if container.ContainerJSONBase.HostConfig != nil {
 			dockerData.NetworkSettings.NetworkMode = container.ContainerJSONBase.HostConfig.NetworkMode
@@ -968,7 +1010,8 @@ func parseService(service swarmtypes.Service, networkMap map[string]*dockertypes
 					}
 					dockerData.NetworkSettings.Networks[network.Name] = network
 				} else {
-					log.Debug("Network not found, id: %s", virtualIP.NetworkID)
+					log.Debugf("Network not found, service: %s, id: %s, addr: %s",
+						service.Spec.Name, virtualIP.NetworkID, virtualIP.Addr)
 				}
 			}
 		}
@@ -992,13 +1035,13 @@ func listTasks(ctx context.Context, dockerClient client.APIClient, serviceID str
 		if task.Status.State != swarmtypes.TaskStateRunning {
 			continue
 		}
-		dockerData := parseTasks(task, serviceDockerData, networkMap, isGlobalSvc)
+		dockerData := parseTasks(ctx, dockerClient, task, serviceDockerData, networkMap, isGlobalSvc)
 		dockerDataList = append(dockerDataList, dockerData)
 	}
 	return dockerDataList, err
 }
 
-func parseTasks(task swarmtypes.Task, serviceDockerData dockerData, networkMap map[string]*dockertypes.NetworkResource, isGlobalSvc bool) dockerData {
+func parseTasks(ctx context.Context, dockerClient client.APIClient, task swarmtypes.Task, serviceDockerData dockerData, networkMap map[string]*dockertypes.NetworkResource, isGlobalSvc bool) dockerData {
 	dockerData := dockerData{
 		ServiceName:     serviceDockerData.Name,
 		Name:            serviceDockerData.Name + "." + strconv.Itoa(task.Slot),
@@ -1010,7 +1053,7 @@ func parseTasks(task swarmtypes.Task, serviceDockerData dockerData, networkMap m
 		dockerData.Name = serviceDockerData.Name + "." + task.ID
 	}
 
-	if task.NetworksAttachments != nil {
+	if len(task.NetworksAttachments) > 0 {
 		dockerData.NetworkSettings.Networks = make(map[string]*networkData)
 		for _, virtualIP := range task.NetworksAttachments {
 			if networkService, present := networkMap[virtualIP.Network.ID]; present {
@@ -1023,6 +1066,20 @@ func parseTasks(task swarmtypes.Task, serviceDockerData dockerData, networkMap m
 						Addr: ip.String(),
 					}
 					dockerData.NetworkSettings.Networks[network.Name] = network
+				}
+			} else if virtualIP.Network.Spec.Name == "host" {
+				log.Debugf("Try load host network IP of container `%s` from swarm node...", dockerData.Name)
+				if label, _ := getLabel(dockerData, labelDockerNetwork); label == "host" {
+					node, _, err := dockerClient.NodeInspectWithRaw(ctx, task.NodeID)
+					if err == nil {
+						dockerData.NetworkSettings.Networks = make(map[string]*networkData)
+						network := &networkData{
+							ID:   "",
+							Name: "host",
+							Addr: node.Status.Addr,
+						}
+						dockerData.NetworkSettings.Networks[network.Name] = network
+					}
 				}
 			}
 		}

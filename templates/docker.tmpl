@@ -5,7 +5,6 @@
       expression = "{{getCircuitBreakerExpression $backend}}"
     {{end}}
 
-    {{if hasLoadBalancerLabel $backend}}
     [backends.backend-{{$backendName}}.loadbalancer]
       method = "{{getLoadBalancerMethod $backend}}"
       sticky = {{getSticky $backend}}
@@ -13,7 +12,6 @@
       [backends.backend-{{$backendName}}.loadBalancer.stickiness]
         cookieName = "{{getStickinessCookieName $backend}}"
       {{end}}
-    {{end}}
 
     {{if hasMaxConnLabels $backend}}
     [backends.backend-{{$backendName}}.maxconn]
@@ -78,6 +76,18 @@
   basicAuth = [{{range getBasicAuth $container}}
     "{{.}}",
   {{end}}]
+  {{if hasRequestHeaders $container}}
+    [frontends."frontend-{{$frontend}}".headers.customrequestheaders]
+    {{range $k, $v := getRequestHeaders $container}}
+    {{$k}} = "{{$v}}"
+    {{end}}
+  {{end}}
+  {{if hasResponseHeaders $container}}
+    [frontends."frontend-{{$frontend}}".headers.customresponseheaders]
+    {{range $k, $v := getResponseHeaders $container}}
+    {{$k}} = "{{$v}}"
+    {{end}}
+  {{end}}
     [frontends."frontend-{{$frontend}}".routes."route-frontend-{{$frontend}}"]
     rule = "{{getFrontendRule $container}}"
   {{end}}

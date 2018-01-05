@@ -4,8 +4,10 @@ import (
 	"time"
 
 	"github.com/containous/flaeg"
+	"github.com/containous/traefik/api"
 	"github.com/containous/traefik/configuration"
 	"github.com/containous/traefik/middlewares/accesslog"
+	"github.com/containous/traefik/ping"
 	"github.com/containous/traefik/provider/boltdb"
 	"github.com/containous/traefik/provider/consul"
 	"github.com/containous/traefik/provider/docker"
@@ -18,7 +20,7 @@ import (
 	"github.com/containous/traefik/provider/marathon"
 	"github.com/containous/traefik/provider/mesos"
 	"github.com/containous/traefik/provider/rancher"
-	"github.com/containous/traefik/provider/web"
+	"github.com/containous/traefik/provider/rest"
 	"github.com/containous/traefik/provider/zk"
 	"github.com/containous/traefik/types"
 )
@@ -43,14 +45,18 @@ func NewTraefikDefaultPointersConfiguration() *TraefikConfiguration {
 	defaultFile.Watch = true
 	defaultFile.Filename = "" //needs equivalent to  viper.ConfigFileUsed()
 
-	// default Web
-	var defaultWeb web.Provider
+	// default Rest
+	var defaultRest rest.Provider
+	defaultRest.EntryPoint = configuration.DefaultInternalEntryPointName
+
+	// TODO: Deprecated - Web provider, use REST provider instead
+	var defaultWeb configuration.WebCompatibility
 	defaultWeb.Address = ":8080"
 	defaultWeb.Statistics = &types.Statistics{
 		RecentErrors: 10,
 	}
 
-	// default Metrics
+	// TODO: Deprecated - default Metrics
 	defaultWeb.Metrics = &types.Metrics{
 		Prometheus: &types.Prometheus{
 			Buckets: types.Buckets{0.1, 0.3, 1.2, 5},
@@ -61,6 +67,10 @@ func NewTraefikDefaultPointersConfiguration() *TraefikConfiguration {
 		},
 		StatsD: &types.Statsd{
 			Address:      "localhost:8125",
+			PushInterval: "10s",
+		},
+		InfluxDB: &types.InfluxDB{
+			Address:      "localhost:8089",
 			PushInterval: "10s",
 		},
 	}
@@ -153,6 +163,17 @@ func NewTraefikDefaultPointersConfiguration() *TraefikConfiguration {
 	var defaultEureka eureka.Provider
 	defaultEureka.Delay = "30s"
 
+	// default Ping
+	var defaultPing = ping.Handler{
+		EntryPoint: "traefik",
+	}
+
+	// default TraefikLog
+	defaultTraefikLog := types.TraefikLog{
+		Format:   "common",
+		FilePath: "",
+	}
+
 	// default AccessLog
 	defaultAccessLog := types.AccessLog{
 		Format:   accesslog.CommonFormat,
@@ -174,10 +195,45 @@ func NewTraefikDefaultPointersConfiguration() *TraefikConfiguration {
 		DialTimeout: flaeg.Duration(configuration.DefaultDialTimeout),
 	}
 
+	// default LifeCycle
+	defaultLifeycle := configuration.LifeCycle{
+		GraceTimeOut: flaeg.Duration(configuration.DefaultGraceTimeout),
+	}
+
+	// default ApiConfiguration
+	defaultAPI := api.Handler{
+		EntryPoint: "traefik",
+		Dashboard:  true,
+	}
+	defaultAPI.Statistics = &types.Statistics{
+		RecentErrors: 10,
+	}
+
+	// default Metrics
+	defaultMetrics := types.Metrics{
+		Prometheus: &types.Prometheus{
+			Buckets:    types.Buckets{0.1, 0.3, 1.2, 5},
+			EntryPoint: "traefik",
+		},
+		Datadog: &types.Datadog{
+			Address:      "localhost:8125",
+			PushInterval: "10s",
+		},
+		StatsD: &types.Statsd{
+			Address:      "localhost:8125",
+			PushInterval: "10s",
+		},
+		InfluxDB: &types.InfluxDB{
+			Address:      "localhost:8089",
+			PushInterval: "10s",
+		},
+	}
+
 	defaultConfiguration := configuration.GlobalConfiguration{
 		Docker:             &defaultDocker,
 		File:               &defaultFile,
 		Web:                &defaultWeb,
+		Rest:               &defaultRest,
 		Marathon:           &defaultMarathon,
 		Consul:             &defaultConsul,
 		ConsulCatalog:      &defaultConsulCatalog,
@@ -192,9 +248,14 @@ func NewTraefikDefaultPointersConfiguration() *TraefikConfiguration {
 		DynamoDB:           &defaultDynamoDB,
 		Retry:              &configuration.Retry{},
 		HealthCheck:        &healthCheck,
-		AccessLog:          &defaultAccessLog,
 		RespondingTimeouts: &respondingTimeouts,
 		ForwardingTimeouts: &forwardingTimeouts,
+		TraefikLog:         &defaultTraefikLog,
+		AccessLog:          &defaultAccessLog,
+		LifeCycle:          &defaultLifeycle,
+		Ping:               &defaultPing,
+		API:                &defaultAPI,
+		Metrics:            &defaultMetrics,
 	}
 
 	return &TraefikConfiguration{
@@ -206,7 +267,6 @@ func NewTraefikDefaultPointersConfiguration() *TraefikConfiguration {
 func NewTraefikConfiguration() *TraefikConfiguration {
 	return &TraefikConfiguration{
 		GlobalConfiguration: configuration.GlobalConfiguration{
-			GraceTimeOut:              flaeg.Duration(10 * time.Second),
 			AccessLogsFile:            "",
 			TraefikLogsFile:           "",
 			LogLevel:                  "ERROR",
