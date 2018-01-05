@@ -1053,7 +1053,7 @@ func parseTasks(ctx context.Context, dockerClient client.APIClient, task swarmty
 	dockerData := dockerData{
 		ServiceName:     serviceDockerData.Name,
 		Name:            serviceDockerData.Name + "." + strconv.Itoa(task.Slot),
-		Labels:          serviceDockerData.Labels,
+		Labels:          labels,
 		NetworkSettings: networkSettings{},
 	}
 
