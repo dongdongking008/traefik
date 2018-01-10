@@ -26,6 +26,7 @@ import (
 	"github.com/containous/traefik/provider/rancher"
 	"github.com/containous/traefik/provider/rest"
 	"github.com/containous/traefik/provider/zk"
+	"github.com/containous/traefik/provider/webapi"
 	"github.com/containous/traefik/tls"
 	"github.com/containous/traefik/types"
 )
@@ -92,6 +93,7 @@ type GlobalConfiguration struct {
 	DynamoDB                  *dynamodb.Provider      `description:"Enable DynamoDB backend with default settings" export:"true"`
 	ServiceFabric             *servicefabric.Provider `description:"Enable Service Fabric backend with default settings" export:"true"`
 	Rest                      *rest.Provider          `description:"Enable Rest backend with default settings" export:"true"`
+	WebAPI                    *webapi.Provider        `description:"Enable WebAPI backend"`
 	API                       *api.Handler            `description:"Enable api/dashboard" export:"true"`
 	Metrics                   *types.Metrics          `description:"Enable a metrics exporter" export:"true"`
 	Ping                      *ping.Handler           `description:"Enable ping" export:"true"`

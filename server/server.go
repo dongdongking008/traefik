@@ -575,6 +575,9 @@ func (s *Server) configureProviders() {
 	if s.globalConfiguration.ServiceFabric != nil {
 		s.providers = append(s.providers, s.globalConfiguration.ServiceFabric)
 	}
+	if s.globalConfiguration.WebAPI != nil {
+		s.providers = append(s.providers, s.globalConfiguration.WebAPI)
+	}
 }
 
 func (s *Server) startProviders() {
