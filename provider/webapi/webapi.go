@@ -8,12 +8,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Sirupsen/logrus"
+	"github.com/sirupsen/logrus"
 	"github.com/containous/traefik/safe"
 	"github.com/containous/traefik/types"
-	"github.com/containous/flaeg"
 	"github.com/cenk/backoff"
 	"github.com/containous/traefik/job"
+	"github.com/containous/flaeg/parse"
 )
 
 // Provider holds configurations of the Provider provider.
@@ -21,7 +21,7 @@ type Provider struct {
 	Endpoint      string         `description:"Comma separated server endpoints"`
 	Cluster       string         `description:"Web cluster"`
 	Watch         bool           `description:"Watch provider"`
-	CheckInterval flaeg.Duration `description:"Check interval for config"`
+	CheckInterval parse.Duration `description:"Check interval for config"`
 	version       int
 }
 

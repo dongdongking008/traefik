@@ -29,12 +29,14 @@ import (
 	"github.com/containous/traefik/provider/zk"
 	"github.com/containous/traefik/types"
 	sf "github.com/jjcollinge/servicefabric"
+	"github.com/containous/traefik/provider/webapi"
+	"github.com/containous/flaeg/parse"
 )
 
 // TraefikConfiguration holds GlobalConfiguration and other stuff
 type TraefikConfiguration struct {
 	configuration.GlobalConfiguration `mapstructure:",squash" export:"true"`
-	ConfigFile                        string `short:"c" description:"Configuration file to use (TOML)." export:"true"`
+	ConfigFile string                 `short:"c" description:"Configuration file to use (TOML)." export:"true"`
 }
 
 // NewTraefikDefaultPointersConfiguration creates a TraefikConfiguration with pointers default values
@@ -173,6 +175,11 @@ func NewTraefikDefaultPointersConfiguration() *TraefikConfiguration {
 	defaultServiceFabric.APIVersion = sf.DefaultAPIVersion
 	defaultServiceFabric.RefreshSeconds = 10
 
+	// default WebAPI
+	var defaultWebAPI webapi.Provider
+	defaultWebAPI.Watch = true
+	defaultWebAPI.CheckInterval = parse.Duration(30 * time.Second)
+
 	// default Ping
 	var defaultPing = ping.Handler{
 		EntryPoint: "traefik",
@@ -274,6 +281,7 @@ func NewTraefikDefaultPointersConfiguration() *TraefikConfiguration {
 		Rancher:            &defaultRancher,
 		Eureka:             &defaultEureka,
 		DynamoDB:           &defaultDynamoDB,
+		WebAPI:             &defaultWebAPI,
 		Retry:              &configuration.Retry{},
 		HealthCheck:        &healthCheck,
 		RespondingTimeouts: &respondingTimeouts,
