@@ -96,13 +96,24 @@ func (p *Provider) buildConfiguration(containersInspected []dockerData) *types.C
 	frontends := map[string][]dockerData{}
 	backends := map[string]dockerData{}
 	servers := map[string][]dockerData{}
-	serviceNames := make(map[string]struct{})
+	serviceNames := make(map[string]string)
 	for idx, container := range filteredContainers {
-		if _, exists := serviceNames[container.ServiceName]; !exists {
-			frontendName := p.getFrontendName(container, idx)
+		if frontendName, exists := serviceNames[container.ServiceName]; exists {
+			if len(container.Labels) > 0 {
+				frontendLabels := make(map[string]string)
+				for labelKey, labelValue := range frontends[frontendName][0].Labels {
+					frontendLabels[labelKey] = labelValue
+				}
+				for labelKey, labelValue := range container.Labels {
+					frontendLabels[labelKey] = labelValue
+				}
+				frontends[frontendName][0].Labels = frontendLabels
+			}
+		} else {
+			frontendName = p.getFrontendName(container, idx)
 			frontends[frontendName] = append(frontends[frontendName], container)
 			if len(container.ServiceName) > 0 {
-				serviceNames[container.ServiceName] = struct{}{}
+				serviceNames[container.ServiceName] = frontendName
 			}
 		}
 		backendName := getBackendName(container)
