@@ -360,7 +360,6 @@ func listServices(ctx context.Context, dockerClient client.APIClient) ([]dockerD
 
 	for _, service := range serviceList {
 		dData := parseService(service, networkMap)
-
 		if isBackendLBSwarm(dData) {
 			if len(dData.NetworkSettings.Networks) > 0 {
 				dockerDataList = append(dockerDataList, dData)
@@ -432,7 +431,7 @@ func listTasks(ctx context.Context, dockerClient client.APIClient, serviceID str
 		if task.Status.State != swarmtypes.TaskStateRunning {
 			continue
 		}
-		dData := parseTasks(task, serviceDockerData, networkMap, isGlobalSvc)
+		dData := parseTasks(ctx, dockerClient, task, serviceDockerData, networkMap, isGlobalSvc)
 		if len(dData.NetworkSettings.Networks) > 0 {
 			dockerDataList = append(dockerDataList, dData)
 		}
@@ -440,7 +439,8 @@ func listTasks(ctx context.Context, dockerClient client.APIClient, serviceID str
 	return dockerDataList, err
 }
 
-func parseTasks(task swarmtypes.Task, serviceDockerData dockerData, networkMap map[string]*dockertypes.NetworkResource, isGlobalSvc bool) dockerData {
+func parseTasks(ctx context.Context, dockerClient client.APIClient, task swarmtypes.Task, serviceDockerData dockerData,
+	networkMap map[string]*dockertypes.NetworkResource, isGlobalSvc bool) dockerData {
 	var labels = map[string]string{}
 	for keyService, valueService := range serviceDockerData.Labels {
 		labels[keyService] = valueService
@@ -478,8 +478,32 @@ func parseTasks(task swarmtypes.Task, serviceDockerData dockerData, networkMap m
 				} else {
 					log.Debugf("No IP addresses found for network %s", virtualIP.Network.ID)
 				}
+			} else if virtualIP.Network.Spec.Name == "host" {
+				if network := getHostNetwork(ctx, dockerClient, task.NodeID); network != nil {
+					network.ID = virtualIP.Network.ID
+					dData.NetworkSettings.Networks[network.Name] = network
+				}
 			}
 		}
 	}
 	return dData
+}
+
+func getHostNetwork(ctx context.Context, dockerClient client.APIClient, nodeID string) *networkData {
+	node, _, err := dockerClient.NodeInspectWithRaw(ctx, nodeID)
+	if err != nil {
+		log.Errorf("Failed to inspect node `%s`", nodeID)
+		return nil
+	}
+
+	addr := node.Status.Addr
+	if addr == "0.0.0.0" {
+		ip, _, _ := net.ParseCIDR(node.ManagerStatus.Addr)
+		addr = ip.String()
+	}
+
+	return &networkData{
+		Name: "host",
+		Addr: addr,
+	}
 }
