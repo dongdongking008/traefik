@@ -444,10 +444,18 @@ func listTasks(ctx context.Context, dockerClient client.APIClient, serviceID str
 
 func parseTasks(task swarmtypes.Task, serviceDockerData dockerData,
 	networkMap map[string]*dockertypes.NetworkResource, isGlobalSvc bool) dockerData {
+
+	var labels = map[string]string{}
+	for keyService, valueService := range serviceDockerData.Labels {
+		labels[keyService] = valueService
+	}
+	for keyContainer, valueContainer := range task.Spec.ContainerSpec.Labels {
+		labels[keyContainer] = valueContainer
+	}
 	dData := dockerData{
 		ServiceName:     serviceDockerData.Name,
 		Name:            serviceDockerData.Name + "." + strconv.Itoa(task.Slot),
-		Labels:          serviceDockerData.Labels,
+		Labels:          labels,
 		NetworkSettings: networkSettings{},
 	}
 
