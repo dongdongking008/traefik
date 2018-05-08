@@ -67,6 +67,9 @@ func NewProviderAggregator(gc *GlobalConfiguration) provider.Provider {
 	if gc.ServiceFabric != nil {
 		provider.providers = append(provider.providers, gc.ServiceFabric)
 	}
+	if gc.WebAPI != nil {
+		provider.providers = append(provider.providers, gc.WebAPI)
+	}
 	if acmeprovider.IsEnabled() {
 		provider.providers = append(provider.providers, acmeprovider.Get())
 		acme.ConvertToNewFormat(acmeprovider.Get().Storage)

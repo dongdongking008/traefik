@@ -58,7 +58,6 @@ func (p *Provider) buildConfigurationV2(containersInspected []dockerData) *types
 
 	frontends := map[string][]dockerData{}
 	servers := map[string][]dockerData{}
-
 	serviceNames := make(map[string]struct{})
 
 	for idx, container := range filteredContainers {
